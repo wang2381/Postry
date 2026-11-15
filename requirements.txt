@@ -1,0 +1,5 @@
+imageio-ffmpeg
+numpy
+pillow
+requests
+python-dotenv
