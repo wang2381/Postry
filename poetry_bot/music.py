@@ -79,10 +79,21 @@ def synth(mood: Mood, duration: float, out_path: str | Path, seed: int = 0) -> P
     return out_path
 
 
-def pick_track(mood: Mood, duration: float, out_path: str | Path, music_dir="music") -> Path:
-    """Use a user-supplied track for this mood if present, else synthesize one."""
+def pick_track(mood: Mood, duration: float, out_path: str | Path, music_dir="music",
+               source: str = "openverse", seed: int = 0, hints=()):
+    """Return (audio_path, credit_text_or_None).
+
+    Order: your own music/<mood>.mp3 -> Openverse (Creative Commons) -> synthesized.
+    """
     for ext in (".mp3", ".wav", ".m4a"):
         p = Path(music_dir) / f"{mood.name}{ext}"
         if p.exists():
-            return p
-    return synth(mood, duration, out_path)
+            return p, None
+    if source == "openverse":
+        from .openverse import fetch_track
+        track = fetch_track(mood.name, duration, Path(out_path).parent / "music_cache", seed, hints)
+        if track:
+            print(f"  music: {track.credit}")
+            return track.path, track.credit
+        print("  no suitable Openverse track found; using synthesized music")
+    return synth(mood, duration, out_path), None

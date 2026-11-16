@@ -37,9 +37,18 @@ def _check(r: requests.Response) -> dict:
 
 
 def post_story(video_url: str) -> str:
+    return _post_video(video_url, {"media_type": "STORIES"})
+
+
+def post_reel(video_url: str, caption: str = "") -> str:
+    """Publish as a Reel (permanent, shown on profile and in the Reels tab)."""
+    return _post_video(video_url, {"media_type": "REELS", "caption": caption, "share_to_feed": "true"})
+
+
+def _post_video(video_url: str, fields: dict) -> str:
     ig_id, token = _need("IG_USER_ID"), _need("IG_ACCESS_TOKEN")
     container = _check(requests.post(f"{GRAPH}/{ig_id}/media", data={
-        "media_type": "STORIES", "video_url": video_url, "access_token": token}, timeout=60))["id"]
+        **fields, "video_url": video_url, "access_token": token}, timeout=60))["id"]
 
     for _ in range(60):  # wait for Instagram to finish processing (~5 min max)
         st = _check(requests.get(f"{GRAPH}/{container}", params={

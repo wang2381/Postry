@@ -55,19 +55,38 @@ def _wrap(line: str, font, max_w: int) -> list[str]:
     return out + [cur] if cur else out
 
 
-def _text_layers(poem: Poem, fps: int):
-    """Pre-render each poem line to an RGBA layer. Returns (layers, total_height)."""
-    all_text = poem.text + poem.title
-    size = 62 if max(len(l) for l in poem.lines) < 45 else 52
+PER_LINE, FADE, HOLD, LAST_HOLD, T0, OUT_FADE, GAP, XFADE = 2.0, 0.9, 2.0, 4.0, 1.5, 0.8, 0.3, 1.2
+
+
+def timeline(poem: Poem):
+    """[(start, end)] per stanza and the total story duration (uncapped).
+    A stanza's text fades out just before `end`; the next stanza starts GAP later."""
+    spans, t, end = [], T0, T0
+    for i, lines in enumerate(poem.stanzas):
+        n = len(lines) + (1 if i == 0 and poem.title else 0)
+        last = i == len(poem.stanzas) - 1
+        end = t + n * PER_LINE + (LAST_HOLD if last else HOLD)
+        spans.append((t, end))
+        t = end + GAP
+    return spans, end
+
+
+def _smooth(x: float) -> float:
+    x = min(max(x, 0.0), 1.0)
+    return x * x * (3 - 2 * x)
+
+
+def _stanza_layers(lines: list[str], title: str, size: int, all_text: str):
+    """Pre-render a stanza (and optional title) to one RGBA layer per line, centred vertically."""
     font = _font(size, all_text)
     title_font = _font(40, all_text)
     max_w = W - 220
     gap, line_h = 34, int(size * 1.35)
 
     items = []  # (lines, font, height)
-    if poem.title:
-        items.append(([poem.title.upper()], title_font, int(40 * 1.6) + 20))
-    for l in poem.lines:
+    if title:
+        items.append(([title.upper()], title_font, int(40 * 1.6) + 20))
+    for l in lines:
         wrapped = _wrap(l, font, max_w)
         items.append((wrapped, font, len(wrapped) * line_h))
 
@@ -76,10 +95,10 @@ def _text_layers(poem: Poem, fps: int):
     y = SAFE_TOP + max(0, (avail - total) // 2)
 
     layers = []
-    for lines, f, h in items:
+    for lns, f, h in items:
         img = Image.new("RGBA", (W, h + 40), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
-        for i, ln in enumerate(lines):
+        for i, ln in enumerate(lns):
             x = (W - f.getlength(ln)) / 2
             yy = 20 + i * line_h
             d.text((x + 3, yy + 4), ln, font=f, fill=(0, 0, 0, 120))  # soft shadow
@@ -87,6 +106,20 @@ def _text_layers(poem: Poem, fps: int):
         layers.append((y - 20, np.asarray(img, dtype=np.float32) / 255.0))
         y += h + gap
     return layers
+
+
+def _credit_layer(text: str):
+    """Small attribution line near the bottom (above the story UI zone)."""
+    font = _font(28, text)
+    lines = _wrap(text, font, W - 200)[:2]
+    h = len(lines) * 40 + 20
+    img = Image.new("RGBA", (W, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    for i, ln in enumerate(lines):
+        x = (W - font.getlength(ln)) / 2
+        d.text((x + 2, 10 + i * 40 + 2), ln, font=font, fill=(0, 0, 0, 120))
+        d.text((x, 10 + i * 40), ln, font=font, fill=(255, 255, 255, 255))
+    return (H - SAFE_BOTTOM - h - 10, np.asarray(img, dtype=np.float32) / 255.0)
 
 
 def _gradient_lut(colors, brightness):
@@ -125,15 +158,30 @@ def _background(t: float, lut, gx, gy, particles) -> np.ndarray:
 
 
 def story_duration(poem: Poem) -> float:
-    return float(np.clip(1.5 + 2.0 * (len(poem.lines) + bool(poem.title)) + 4.0, 10, 55))
+    return float(np.clip(timeline(poem)[1], 10, 58))
 
 
 def render(poem: Poem, mood: Mood, audio_path: str | Path, out_path: str | Path,
-           duration: float | None = None, progress=True) -> Path:
-    layers = _text_layers(poem, FPS)
-    t_first, per_line, fade = 1.5, 2.0, 0.9
+           duration: float | None = None, progress=True, credit: str | None = None,
+           bg_clips: list | None = None) -> Path:
+    """bg_clips: optional list of looping video clips, one per stanza (scene changes
+    crossfade as each new stanza begins). Without it, the procedural gradient is used."""
+    size = 62 if max(len(l) for l in poem.lines) < 45 else 52
+    all_text = poem.text + poem.title
+    stanza_layers = [_stanza_layers(lines, poem.title if i == 0 else "", size, all_text)
+                     for i, lines in enumerate(poem.stanzas)]
+    spans, _ = timeline(poem)
+    credit_layer = _credit_layer(credit) if credit else None
     duration = duration or story_duration(poem)
     n_frames = int(duration * FPS)
+
+    # scene i starts when stanza i-1's text has finished; it crossfades in over XFADE
+    scenes = []
+    if bg_clips:
+        starts = [0.0] + [spans[min(i - 1, len(spans) - 1)][1] for i in range(1, len(bg_clips))]
+        for i, clip in enumerate(bg_clips):
+            end = (starts[i + 1] + XFADE) if i + 1 < len(bg_clips) else duration
+            scenes.append({"clip": clip, "start": starts[i], "end": min(end, duration), "proc": None, "last": None})
 
     rng = np.random.default_rng(7)
     particles = np.stack([rng.random(45), rng.random(45), 0.02 + 0.04 * rng.random(45),
@@ -150,23 +198,68 @@ def render(poem: Poem, mood: Mood, audio_path: str | Path, out_path: str | Path,
            "-i", str(audio_path),
            "-map", "0:v", "-map", "1:a", "-t", f"{duration:.2f}",
            "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-pix_fmt", "yuv420p",
+           "-af", f"afade=t=in:d=1,afade=t=out:st={max(duration - 3, 0):.2f}:d=3,loudnorm=I=-18:TP=-2",
            "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(out_path)]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+
+    def scene_frame(sc, t):
+        """Next decoded frame of a scene (decoder starts lazily; repeats last frame at EOF)."""
+        if sc["proc"] is None:
+            sc["proc"] = subprocess.Popen(
+                [ffmpeg, "-loglevel", "error", "-stream_loop", "-1", "-i", str(sc["clip"]), "-map", "0:v:0",
+                 "-vf", f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},fps={FPS}",
+                 "-t", f"{sc['end'] - sc['start'] + 0.2:.2f}", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+                stdout=subprocess.PIPE)
+        n, buf = W * H * 3, b""
+        while len(buf) < n:
+            more = sc["proc"].stdout.read(n - len(buf))
+            if not more:
+                break
+            buf += more
+        if len(buf) == n:
+            sc["last"] = np.frombuffer(buf, np.uint8).reshape(H, W, 3).astype(np.float32)
+        return sc["last"]
+
+    def background(t):
+        active = [sc for sc in scenes if sc["start"] <= t < sc["end"]]
+        if not active:
+            return None
+        frames = [scene_frame(sc, t) for sc in active]
+        if len(frames) == 1 or frames[0] is None or frames[-1] is None:
+            return frames[-1] if frames[-1] is not None else frames[0]
+        a = _smooth((t - active[-1]["start"]) / XFADE)
+        return frames[0] * (1 - a) + frames[-1] * a
 
     try:
         for f in range(n_frames):
             t = f / FPS
-            frame = _background(t, lut, gx, gy, particles) * vign
-            for i, (y0, layer) in enumerate(layers):
-                a = np.clip((t - (t_first + i * per_line)) / fade, 0, 1)
-                if a <= 0:
+            bg = background(t) if scenes else None
+            if bg is not None:
+                frame = bg * 0.72 * vign  # dim a little so the poem stays readable
+            else:
+                frame = _background(t, lut, gx, gy, particles) * vign
+            for s, (t0, t1) in enumerate(spans):
+                if t < t0:
                     continue
-                a = a * a * (3 - 2 * a)  # smoothstep
-                rise = int((1 - a) * 24)
+                last = s == len(spans) - 1
+                out = 1.0 if last else 1.0 - _smooth((t - (t1 - OUT_FADE)) / OUT_FADE)
+                if out <= 0:
+                    continue
+                for i, (y0, layer) in enumerate(stanza_layers[s]):
+                    a = _smooth((t - (t0 + i * PER_LINE)) / FADE)
+                    if a <= 0:
+                        continue
+                    rise = int((1 - a) * 24)
+                    h = layer.shape[0]
+                    ys = y0 + rise
+                    alpha = layer[..., 3:4] * a * out
+                    frame[ys:ys + h] = frame[ys:ys + h] * (1 - alpha) + layer[..., :3] * 255 * alpha
+            if credit_layer is not None:
+                y0, layer = credit_layer
+                a = float(np.clip((t - 0.8) / 0.8, 0, 1))
                 h = layer.shape[0]
-                ys = y0 + rise
-                alpha = layer[..., 3:4] * a
-                frame[ys:ys + h] = frame[ys:ys + h] * (1 - alpha) + layer[..., :3] * 255 * alpha
+                alpha = layer[..., 3:4] * a * 0.85
+                frame[y0:y0 + h] = frame[y0:y0 + h] * (1 - alpha) + layer[..., :3] * 255 * alpha
             # fade to black at the end
             if t > duration - 1.0:
                 frame *= max(0.0, (duration - t))
@@ -174,6 +267,9 @@ def render(poem: Poem, mood: Mood, audio_path: str | Path, out_path: str | Path,
             if progress and f % FPS == 0:
                 print(f"\r  rendering {f / n_frames:4.0%}", end="", flush=True)
     finally:
+        for sc in scenes:
+            if sc["proc"]:
+                sc["proc"].kill()
         proc.stdin.close()
         proc.wait()
     if progress:
